@@ -998,3 +998,356 @@ class TestProcessToolHandler:
 
 # =========================================================================
 # format_process_notification + drain_notifications (shared helpers)
+# =========================================================================
+
+from tools.process_registry import format_process_notification
+
+
+def test_format_completion_event():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_abc",
+        "command": "sleep 5",
+        "exit_code": 0,
+        "output": "done",
+    }
+    result = format_process_notification(evt)
+    assert "[IMPORTANT: Background process proc_abc completed normally" in result
+    assert "exit code 0" in result
+    assert "Command: sleep 5" in result
+    assert "Output:\ndone]" in result
+
+
+def test_format_killed_completion_event_names_source_and_signal():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_killed",
+        "command": "sleep 5",
+        "exit_code": -15,
+        "completion_reason": "killed",
+        "termination_source": "process.kill",
+        "output": "",
+    }
+    result = format_process_notification(evt)
+    assert "proc_killed terminated by process.kill" in result
+    assert "exit code -15, SIGTERM" in result
+
+
+def test_format_external_sigterm_does_not_claim_agent_kill():
+    evt = {
+        "type": "completion",
+        "session_id": "proc_external",
+        "command": "sleep 5",
+        "exit_code": 143,
+        "output": "",
+    }
+    result = format_process_notification(evt)
+    assert "proc_external exited" in result
+    assert "terminated by" not in result
+    assert "exit code 143, SIGTERM" in result
+
+
+def test_format_watch_match_event():
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_xyz",
+        "command": "tail -f log",
+        "pattern": "ERROR",
+        "output": "ERROR: disk full",
+        "suppressed": 0,
+    }
+    result = format_process_notification(evt)
+    assert 'watch pattern "ERROR"' in result
+    assert "Matched output:\nERROR: disk full" in result
+
+
+def test_format_watch_match_with_suppressed():
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_xyz",
+        "command": "tail -f log",
+        "pattern": "WARN",
+        "output": "WARN: low mem",
+        "suppressed": 3,
+    }
+    result = format_process_notification(evt)
+    assert "3 earlier matches were suppressed" in result
+
+
+def test_format_watch_disabled_event():
+    evt = {
+        "type": "watch_disabled",
+        "message": "Watch disabled for proc_xyz: too many matches",
+    }
+    result = format_process_notification(evt)
+    assert "[IMPORTANT: Watch disabled for proc_xyz" in result
+
+
+def test_format_returns_none_for_empty_event():
+    evt = {}
+    result = format_process_notification(evt)
+    assert result is not None
+    assert "unknown" in result
+
+
+def test_drain_notifications_returns_pending_events():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_drain1",
+        "command": "echo hi",
+        "exit_code": 0,
+        "output": "hi",
+    })
+    process_registry.completion_queue.put({
+        "type": "watch_match",
+        "session_id": "proc_drain2",
+        "command": "tail -f x",
+        "pattern": "ERR",
+        "output": "ERR found",
+        "suppressed": 0,
+    })
+
+    try:
+        results = process_registry.drain_notifications()
+        assert len(results) == 2
+        assert results[0][0]["session_id"] == "proc_drain1"
+        assert "proc_drain1 completed normally" in results[0][1]
+        assert results[1][0]["session_id"] == "proc_drain2"
+        assert "watch pattern" in results[1][1]
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+        process_registry._completion_consumed.discard("proc_drain1")
+        process_registry._completion_consumed.discard("proc_drain2")
+
+
+def test_drain_notifications_skips_consumed():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    process_registry._completion_consumed.add("proc_consumed")
+    process_registry.completion_queue.put({
+        "type": "completion",
+        "session_id": "proc_consumed",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+    })
+
+    try:
+        results = process_registry.drain_notifications()
+        assert len(results) == 0
+    finally:
+        process_registry._completion_consumed.discard("proc_consumed")
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_empty_queue():
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    results = process_registry.drain_notifications()
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# _terminate_host_pid — cross-platform process-tree termination
+# ---------------------------------------------------------------------------
+
+
+class TestTerminateHostPidWindows:
+    """Windows branch uses ``taskkill /T /F`` — the documented MS tree-kill
+    primitive. We can't use psutil's ``children(recursive=True)`` /
+    ``.terminate()`` path on Windows because (1) Windows doesn't maintain
+    a Unix-style process tree so the walk is unreliable, and (2)
+    ``Process.terminate()`` on Windows is ``TerminateProcess()`` for the
+    target handle only, not the tree.
+    """
+
+    def test_windows_invokes_taskkill_with_tree_and_force_flags(self, monkeypatch):
+        """The Windows branch must shell out to ``taskkill /PID N /T /F``."""
+        from tools import process_registry as pr
+
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert captured["args"][0] == "taskkill"
+        assert "/PID" in captured["args"]
+        assert "12345" in captured["args"]
+        assert "/T" in captured["args"], "Tree flag required to reach descendants"
+        assert "/F" in captured["args"], "Force flag required for headless Chromium"
+
+    def test_windows_falls_back_to_os_kill_when_taskkill_missing(self, monkeypatch):
+        """If ``taskkill.exe`` is somehow unavailable, fall back to a bare
+        ``os.kill(pid, SIGTERM)`` so we at least try to kill the parent."""
+        from tools import process_registry as pr
+
+        kill_calls = []
+
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError("taskkill not found")
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        monkeypatch.setattr(pr.os, "kill", fake_kill)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert kill_calls == [(12345, signal.SIGTERM)]
+
+    def test_windows_does_not_call_psutil(self, monkeypatch):
+        """The Windows branch must NOT exercise the psutil tree-walk
+        (it's unreliable on Windows — see the function docstring)."""
+        from tools import process_registry as pr
+        import psutil
+
+        psutil_calls = []
+
+        class _BoomProcess:
+            def __init__(self, pid):
+                psutil_calls.append(("Process", pid))
+
+            def children(self, recursive=False):
+                psutil_calls.append(("children", recursive))
+                return []
+
+            def terminate(self):
+                psutil_calls.append(("terminate",))
+
+        def fake_run(args, **kwargs):
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        monkeypatch.setattr(psutil, "Process", _BoomProcess)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert psutil_calls == [], (
+            f"Windows branch must not touch psutil, but saw {psutil_calls!r}"
+        )
+
+
+class TestTerminateHostPidPosix:
+    """POSIX branch walks the tree via psutil and SIGTERMs children first."""
+
+    def test_posix_walks_tree_and_terminates_children_then_parent(self, monkeypatch):
+        from tools import process_registry as pr
+        import psutil
+
+        terminate_order = []
+
+        class _FakeChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_FakeChild(101), _FakeChild(102), _FakeChild(103)]
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert terminate_order == [101, 102, 103, 12345], (
+            "Children must be terminated before the parent"
+        )
+
+    def test_posix_no_such_process_swallowed(self, monkeypatch):
+        from tools import process_registry as pr
+        import psutil
+
+        def boom(pid):
+            raise psutil.NoSuchProcess(pid)
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(psutil, "Process", boom)
+
+        # Must not raise.
+        pr.ProcessRegistry._terminate_host_pid(999999999)
+
+    def test_posix_oserror_falls_back_to_os_killpg(self, monkeypatch):
+        from tools import process_registry as pr
+        import psutil
+
+        def boom(pid):
+            raise PermissionError("can't read /proc")
+
+        killpg_calls = []
+        kill_calls = []
+
+        def fake_killpg(pid, sig):
+            killpg_calls.append((pid, sig))
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(psutil, "Process", boom)
+        monkeypatch.setattr(pr.os, "killpg", fake_killpg)
+        monkeypatch.setattr(pr.os, "kill", fake_kill)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert killpg_calls == [(12345, signal.SIGTERM)]
+        assert kill_calls == []
+
+    def test_posix_oserror_falls_back_to_os_kill_if_killpg_fails(self, monkeypatch):
+        from tools import process_registry as pr
+        import psutil
+
+        def boom(pid):
+            raise PermissionError("can't read /proc")
+
+        killpg_calls = []
+        kill_calls = []
+
+        def fake_killpg(pid, sig):
+            killpg_calls.append((pid, sig))
+            raise ProcessLookupError("no such process group")
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(psutil, "Process", boom)
+        monkeypatch.setattr(pr.os, "killpg", fake_killpg)
+        monkeypatch.setattr(pr.os, "kill", fake_kill)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert killpg_calls == [(12345, signal.SIGTERM)]
+        assert kill_calls == [(12345, signal.SIGTERM)]
