@@ -997,3 +997,767 @@ class ProcessRegistry:
                         pass
             except Exception as e:
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
+
+        with session._lock:
+            if drained:
+                session.output_buffer += drained
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            session.exited = True
+            if session.completion_reason != "killed":
+                session.exit_code = rc
+                session.completion_reason = "exited"
+        logger.info(
+            "Reconciled session %s: direct child exited with code %s but reader "
+            "was still blocked (orphaned pipe). Flipped to exited.",
+            session.id, rc,
+        )
+        self._move_to_finished(session)
+
+    def poll(self, session_id: str) -> dict:
+        """Check status and get new output for a background process."""
+        from tools.ansi_strip import strip_ansi
+
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        # Reconcile against real child state before reading session.exited.
+        # Guards against orphaned-pipe reader hangs (issue #17327).
+        self._reconcile_local_exit(session)
+
+        with session._lock:
+            output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+
+        result = {
+            "session_id": session.id,
+            "command": session.command,
+            "status": "exited" if session.exited else "running",
+            "pid": session.pid,
+            "uptime_seconds": int(time.time() - session.started_at),
+            "output_preview": output_preview,
+        }
+        if session.exited:
+            result["exit_code"] = session.exit_code
+            result["completion_reason"] = session.completion_reason
+            result["termination_source"] = session.termination_source
+            self._completion_consumed.add(session_id)
+        if session.detached:
+            result["detached"] = True
+            result["note"] = "Process recovered after restart -- output history unavailable"
+        return result
+
+    def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
+        """Read the full output log with optional pagination by lines."""
+        from tools.ansi_strip import strip_ansi
+
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        with session._lock:
+            full_output = strip_ansi(session.output_buffer)
+
+        lines = full_output.splitlines()
+        total_lines = len(lines)
+
+        # Default: last N lines
+        if offset == 0 and limit > 0:
+            selected = lines[-limit:]
+        else:
+            selected = lines[offset:offset + limit]
+
+        result = {
+            "session_id": session.id,
+            "status": "exited" if session.exited else "running",
+            "output": "\n".join(selected),
+            "total_lines": total_lines,
+            "showing": f"{len(selected)} lines",
+        }
+        if session.exited:
+            self._completion_consumed.add(session_id)
+        return result
+
+    def wait(self, session_id: str, timeout: int = None) -> dict:
+        """
+        Block until a process exits, timeout, or interrupt.
+
+        Args:
+            session_id: The process to wait for.
+            timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
+
+        Returns:
+            dict with status ("exited", "timeout", "interrupted", "not_found")
+            and output snapshot.
+        """
+        from tools.ansi_strip import strip_ansi
+        from tools.interrupt import is_interrupted as _is_interrupted
+
+        try:
+            default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+        except (ValueError, TypeError):
+            default_timeout = 180
+        max_timeout = default_timeout
+        requested_timeout = timeout
+        timeout_note = None
+
+        if requested_timeout and requested_timeout > max_timeout:
+            effective_timeout = max_timeout
+            timeout_note = (
+                f"Requested wait of {requested_timeout}s was clamped "
+                f"to configured limit of {max_timeout}s"
+            )
+        else:
+            effective_timeout = requested_timeout or max_timeout
+
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        deadline = time.monotonic() + effective_timeout
+
+        while time.monotonic() < deadline:
+            session = self._refresh_detached_session(session)
+            if session is None:
+                return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            # Reconcile against real child state — guards against orphaned-
+            # pipe reader hangs where the reader is blocked but the direct
+            # child has already exited (issue #17327).
+            self._reconcile_local_exit(session)
+            if session.exited:
+                self._completion_consumed.add(session_id)
+                result = {
+                    "status": "exited",
+                    "exit_code": session.exit_code,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": strip_ansi(session.output_buffer[-2000:]),
+                }
+                if timeout_note:
+                    result["timeout_note"] = timeout_note
+                return result
+
+            if _is_interrupted():
+                result = {
+                    "status": "interrupted",
+                    "output": strip_ansi(session.output_buffer[-1000:]),
+                    "note": "User sent a new message -- wait interrupted",
+                }
+                if timeout_note:
+                    result["timeout_note"] = timeout_note
+                return result
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            session._completion_event.wait(timeout=min(1.0, remaining))
+
+        result = {
+            "status": "timeout",
+            "output": strip_ansi(session.output_buffer[-1000:]),
+        }
+        if timeout_note:
+            result["timeout_note"] = timeout_note
+        else:
+            result["timeout_note"] = f"Waited {effective_timeout}s, process still running"
+        return result
+
+    def kill_process(self, session_id: str, *, source: str = "process.kill") -> dict:
+        """Kill a background process."""
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        if session.exited:
+            return {
+                "status": "already_exited",
+                "exit_code": session.exit_code,
+            }
+
+        # Kill via PTY, Popen (local), or env execute (non-local)
+        try:
+            if session._pty:
+                # PTY process -- terminate via ptyprocess
+                try:
+                    session._pty.terminate(force=True)
+                except Exception:
+                    if session.pid:
+                        os.kill(session.pid, signal.SIGTERM)
+            elif session.process:
+                # Local process -- kill the process tree
+                try:
+                    if _IS_WINDOWS:
+                        session.process.terminate()
+                    else:
+                        import psutil
+                        try:
+                            parent = psutil.Process(session.process.pid)
+                            for child in parent.children(recursive=True):
+                                try:
+                                    child.terminate()
+                                except psutil.NoSuchProcess:
+                                    pass
+                            parent.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
+                except (ProcessLookupError, PermissionError):
+                    session.process.kill()
+            elif session.env_ref and session.pid:
+                # Non-local -- kill inside sandbox
+                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            elif session.detached and session.pid_scope == "host" and session.pid:
+                if not self._is_host_pid_alive(session.pid):
+                    with session._lock:
+                        session.exited = True
+                        session.exit_code = None
+                    self._move_to_finished(session)
+                    return {
+                        "status": "already_exited",
+                        "exit_code": session.exit_code,
+                    }
+                self._terminate_host_pid(session.pid)
+            else:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Recovered process cannot be killed after restart because "
+                        "its original runtime handle is no longer available"
+                    ),
+                }
+            session.exited = True
+            session.exit_code = -15  # SIGTERM
+            session.completion_reason = "killed"
+            session.termination_source = source
+            self._move_to_finished(session)
+            self._write_checkpoint()
+            return {
+                "status": "killed",
+                "session_id": session.id,
+                "completion_reason": session.completion_reason,
+                "termination_source": session.termination_source,
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def write_stdin(self, session_id: str, data: str) -> dict:
+        """Send raw data to a running process's stdin (no newline appended)."""
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if session.exited:
+            return {"status": "already_exited", "error": "Process has already finished"}
+
+        # PTY mode -- write through pty handle.
+        if hasattr(session, '_pty') and session._pty:
+            try:
+                # pywinpty expects str on Windows; ptyprocess expects bytes on POSIX.
+                if _IS_WINDOWS:
+                    pty_data = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                else:
+                    pty_data = data.encode("utf-8") if isinstance(data, str) else data
+                session._pty.write(pty_data)
+                return {"status": "ok", "bytes_written": len(data)}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        # Popen mode -- write through stdin pipe
+        if not session.process or not session.process.stdin:
+            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+        try:
+            session.process.stdin.write(data)
+            session.process.stdin.flush()
+            return {"status": "ok", "bytes_written": len(data)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def submit_stdin(self, session_id: str, data: str = "") -> dict:
+        """Send data + newline to a running process's stdin (like pressing Enter)."""
+        return self.write_stdin(session_id, data + "\n")
+
+    def close_stdin(self, session_id: str) -> dict:
+        """Close a running process's stdin / send EOF without killing the process."""
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if session.exited:
+            return {"status": "already_exited", "error": "Process has already finished"}
+
+        if hasattr(session, '_pty') and session._pty:
+            try:
+                session._pty.sendeof()
+                return {"status": "ok", "message": "EOF sent"}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        if not session.process or not session.process.stdin:
+            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+        try:
+            session.process.stdin.close()
+            return {"status": "ok", "message": "stdin closed"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def count_running(self) -> int:
+        """Return the count of currently-running background processes.
+
+        Cheap O(1) read of the running dict, suitable for status-bar polling
+        on every render tick. CPython dict ``len()`` is atomic; callers do not
+        need to hold ``self._lock``. Reflects ``_running`` only: sessions are
+        moved to ``_finished`` when their subprocess exits.
+        """
+        try:
+            return len(self._running)
+        except Exception:
+            return 0
+
+    def list_sessions(self, task_id: str = None) -> list:
+        """List all running and recently-finished processes."""
+        with self._lock:
+            all_sessions = list(self._running.values()) + list(self._finished.values())
+
+        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+
+        if task_id:
+            all_sessions = [s for s in all_sessions if s.task_id == task_id]
+
+        result = []
+        for s in all_sessions:
+            entry = {
+                "session_id": s.id,
+                "command": s.command[:200],
+                "cwd": s.cwd,
+                "pid": s.pid,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
+                "uptime_seconds": int(time.time() - s.started_at),
+                "status": "exited" if s.exited else "running",
+                "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+            }
+            if s.exited:
+                entry["exit_code"] = s.exit_code
+            if s.detached:
+                entry["detached"] = True
+            result.append(entry)
+        return result
+
+    # ----- Session/Task Queries (for gateway integration) -----
+
+    def has_active_processes(self, task_id: str) -> bool:
+        """Check if there are active (running) processes for a task_id."""
+        with self._lock:
+            sessions = list(self._running.values())
+
+        for session in sessions:
+            self._refresh_detached_session(session)
+
+        with self._lock:
+            return any(
+                s.task_id == task_id and not s.exited
+                for s in self._running.values()
+            )
+
+    def has_active_for_session(self, session_key: str) -> bool:
+        """Check if there are active processes for a gateway session key."""
+        with self._lock:
+            sessions = list(self._running.values())
+
+        for session in sessions:
+            self._refresh_detached_session(session)
+
+        with self._lock:
+            return any(
+                s.session_key == session_key and not s.exited
+                for s in self._running.values()
+            )
+
+    def kill_all(self, task_id: str = None) -> int:
+        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        with self._lock:
+            targets = [
+                s for s in self._running.values()
+                if (task_id is None or s.task_id == task_id) and not s.exited
+            ]
+
+        killed = 0
+        for session in targets:
+            result = self.kill_process(session.id, source="kill_all")
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
+    # ----- Cleanup / Pruning -----
+
+    def _prune_if_needed(self):
+        """Remove oldest finished sessions if over MAX_PROCESSES. Must hold _lock."""
+        # First prune expired finished sessions
+        now = time.time()
+        expired = [
+            sid for sid, s in self._finished.items()
+            if (now - s.started_at) > FINISHED_TTL_SECONDS
+        ]
+        for sid in expired:
+            del self._finished[sid]
+            self._completion_consumed.discard(sid)
+
+        # If still over limit, remove oldest finished
+        total = len(self._running) + len(self._finished)
+        if total >= MAX_PROCESSES and self._finished:
+            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+            del self._finished[oldest_id]
+            self._completion_consumed.discard(oldest_id)
+
+        # Drop any _completion_consumed entries whose sessions are no longer
+        # tracked at all — belt-and-suspenders against module-lifetime growth
+        # on process-registry lookup paths that don't reach the dict prunes.
+        tracked = self._running.keys() | self._finished.keys()
+        stale = self._completion_consumed - tracked
+        if stale:
+            self._completion_consumed -= stale
+
+    # ----- Checkpoint (crash recovery) -----
+
+    def _write_checkpoint(self):
+        """Write running process metadata to checkpoint file atomically."""
+        try:
+            with self._lock:
+                entries = []
+                for s in self._running.values():
+                    if not s.exited:
+                        entries.append({
+                            "session_id": s.id,
+                            "command": s.command,
+                            "pid": s.pid,
+                            "pid_scope": s.pid_scope,
+                            "cwd": s.cwd,
+                            "started_at": s.started_at,
+                            "task_id": s.task_id,
+                            "session_key": s.session_key,
+                            "watcher_platform": s.watcher_platform,
+                            "watcher_chat_id": s.watcher_chat_id,
+                            "watcher_user_id": s.watcher_user_id,
+                            "watcher_user_name": s.watcher_user_name,
+                            "watcher_thread_id": s.watcher_thread_id,
+                            "watcher_message_id": s.watcher_message_id,
+                            "watcher_interval": s.watcher_interval,
+                            "notify_on_complete": s.notify_on_complete,
+                            "watch_patterns": s.watch_patterns,
+                        })
+            
+            # Atomic write to avoid corruption on crash
+            from utils import atomic_json_write
+            atomic_json_write(CHECKPOINT_PATH, entries)
+        except Exception as e:
+            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+
+    def recover_from_checkpoint(self) -> int:
+        """
+        On gateway startup, probe PIDs from checkpoint file.
+
+        Returns the number of processes recovered as detached.
+        """
+        if not CHECKPOINT_PATH.exists():
+            return 0
+
+        try:
+            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+
+        recovered = 0
+        for entry in entries:
+            pid = entry.get("pid")
+            if not pid:
+                continue
+
+            pid_scope = entry.get("pid_scope", "host")
+            if pid_scope != "host":
+                # Sandbox-backed processes keep only in-sandbox PIDs in the
+                # checkpoint, which are not meaningful to the restarted host
+                # process once the original environment handle is gone.
+                logger.info(
+                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
+                    entry.get("command", "unknown")[:60],
+                    pid,
+                    pid_scope,
+                )
+                continue
+
+            # Check if PID is still alive
+            alive = self._is_host_pid_alive(pid)
+
+            if alive:
+                session = ProcessSession(
+                    id=entry["session_id"],
+                    command=entry.get("command", "unknown"),
+                    task_id=entry.get("task_id", ""),
+                    session_key=entry.get("session_key", ""),
+                    pid=pid,
+                    pid_scope=pid_scope,
+                    cwd=entry.get("cwd"),
+                    started_at=entry.get("started_at", time.time()),
+                    detached=True,  # Can't read output, but can report status + kill
+                    watcher_platform=entry.get("watcher_platform", ""),
+                    watcher_chat_id=entry.get("watcher_chat_id", ""),
+                    watcher_user_id=entry.get("watcher_user_id", ""),
+                    watcher_user_name=entry.get("watcher_user_name", ""),
+                    watcher_thread_id=entry.get("watcher_thread_id", ""),
+                    watcher_message_id=entry.get("watcher_message_id", ""),
+                    watcher_interval=entry.get("watcher_interval", 0),
+                    notify_on_complete=entry.get("notify_on_complete", False),
+                    watch_patterns=entry.get("watch_patterns", []),
+                )
+                with self._lock:
+                    self._running[session.id] = session
+                recovered += 1
+                logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+
+                # Re-enqueue watcher so gateway can resume notifications
+                if session.watcher_interval > 0:
+                    self.pending_watchers.append({
+                        "session_id": session.id,
+                        "check_interval": session.watcher_interval,
+                        "session_key": session.session_key,
+                        "platform": session.watcher_platform,
+                        "chat_id": session.watcher_chat_id,
+                        "user_id": session.watcher_user_id,
+                        "user_name": session.watcher_user_name,
+                        "thread_id": session.watcher_thread_id,
+                        "message_id": session.watcher_message_id,
+                        "notify_on_complete": session.notify_on_complete,
+                    })
+
+        self._write_checkpoint()
+
+        return recovered
+
+
+# Module-level singleton
+process_registry = ProcessRegistry()
+
+
+def _format_age(seconds: float) -> str:
+    """Human-friendly elapsed string ('18m', '2h3m', '45s')."""
+    try:
+        s = int(max(0, seconds))
+    except (TypeError, ValueError):
+        return "?"
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m" if s == 0 else f"{m}m{s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h" if m == 0 else f"{h}h{m}m"
+
+
+def _format_async_delegation(evt: dict) -> str:
+    """Format an async-delegation completion into a self-contained re-injection.
+
+    Carries the FULL original task source (goal, the context the parent
+    supplied, toolsets, role, model) plus dispatch time, status, and the
+    complete result summary. When this re-enters the conversation the agent
+    may be deep in unrelated context and won't remember why the subagent
+    existed, so the block is written to stand entirely on its own — enough to
+    use the result OR re-dispatch if the world has moved on.
+    """
+    import time as _time
+
+    deleg_id = evt.get("delegation_id", "unknown")
+    goal = evt.get("goal", "") or ""
+    context = evt.get("context")
+    toolsets = evt.get("toolsets")
+    role = evt.get("role") or "leaf"
+    model = evt.get("model") or "?"
+    status = evt.get("status") or "completed"
+    summary = evt.get("summary")
+    error = evt.get("error")
+    api_calls = evt.get("api_calls", 0)
+    duration = evt.get("duration_seconds", "?")
+    dispatched_at = evt.get("dispatched_at")
+    completed_at = evt.get("completed_at") or _time.time()
+
+    age = ""
+    if isinstance(dispatched_at, (int, float)):
+        age = f" ({_format_age(completed_at - dispatched_at)} ago)"
+
+    lines = [
+        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        "A background subagent you dispatched earlier has finished. You may "
+        "have moved on since dispatching it; the full task source is below so "
+        "you can act on the result or re-dispatch if things have changed.",
+        "",
+    ]
+    if isinstance(dispatched_at, (int, float)):
+        ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
+        lines.append(f"Dispatched: {ts}{age}")
+    lines.append(f"Original goal: {goal}")
+    if context:
+        lines.append(f"Context you provided: {context}")
+    if toolsets:
+        lines.append(f"Toolsets: {', '.join(toolsets)}")
+    lines.append(f"Role: {role}   Model: {model}")
+    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
+    lines.append("--- RESULT ---")
+    if status in ("completed", "success") and summary:
+        lines.append(summary)
+    elif status == "interrupted":
+        lines.append(
+            "The subagent was interrupted before completing"
+            + (f": {error}" if error else ".")
+        )
+        if summary:
+            lines.append("Partial output:")
+            lines.append(summary)
+    else:
+        # error / timeout / failed
+        lines.append(
+            f"The subagent did not complete successfully (status={status})."
+            + (f"\n{error}" if error else "")
+        )
+        if summary:
+            lines.append("Partial output:")
+            lines.append(summary)
+    return "\n".join(lines)
+
+
+def format_process_notification(evt: dict) -> "str | None":
+    """Format a process notification event into a [IMPORTANT: ...] message.
+
+    Handles completion events (notify_on_complete), watch pattern matches,
+    and watch disabled events from the unified completion_queue.
+    """
+    evt_type = evt.get("type", "completion")
+    _sid = evt.get("session_id", "unknown")
+    _cmd = evt.get("command", "unknown")
+
+    if evt_type == "watch_disabled":
+        return f"[IMPORTANT: {evt.get('message', '')}]"
+
+    if evt_type == "watch_match":
+        _pat = evt.get("pattern", "?")
+        _out = evt.get("output", "")
+        _sup = evt.get("suppressed", 0)
+        text = (
+            f"[IMPORTANT: Background process {_sid} matched "
+            f"watch pattern \"{_pat}\".\n"
+            f"Command: {_cmd}\n"
+            f"Matched output:\n{_out}"
+        )
+        if _sup:
+            text += f"\n({_sup} earlier matches were suppressed by rate limit)"
+        text += "]"
+        return text
+
+    if evt_type == "async_delegation":
+        return _format_async_delegation(evt)
+
+    _exit = evt.get("exit_code", "?")
+    _out = evt.get("output", "")
+    _reason = evt.get("completion_reason") or "exited"
+    _source = evt.get("termination_source") or ""
+    _signal = ""
+    if _exit in {-15, 143, "-15", "143"}:
+        _signal = ", SIGTERM"
+    if _reason == "killed":
+        _status = f"terminated by {_source or 'Hermes'}"
+    elif _reason == "lost":
+        _status = "marked lost because the process backend disappeared"
+    elif _reason == "failed_start":
+        _status = "failed to start"
+    elif _exit == 0:
+        _status = "completed normally"
+    else:
+        _status = "exited"
+    return (
+        f"[IMPORTANT: Background process {_sid} {_status} "
+        f"(exit code {_exit}{_signal}).\n"
+        f"Command: {_cmd}\n"
+        f"Output:\n{_out}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Registry -- the "process" tool schema + handler
+# ---------------------------------------------------------------------------
+from tools.registry import registry, tool_error
+
+PROCESS_SCHEMA = {
+    "name": "process",
+    "description": (
+        "Manage background processes started with terminal(background=true). "
+        "Actions: 'list' (show all), 'poll' (check status + new output), "
+        "'log' (full output with pagination), 'wait' (block until done or timeout), "
+        "'kill' (terminate), 'write' (send raw stdin data without newline), "
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
+                "description": "Action to perform on background processes"
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Process session ID (from terminal background output). Required for all actions except 'list'."
+            },
+            "data": {
+                "type": "string",
+                "description": "Text to send to process stdin (for 'write' and 'submit' actions)"
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "minimum": 1
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Line offset for 'log' action (default: last 200 lines)"
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max lines to return for 'log' action",
+                "minimum": 1
+            }
+        },
+        "required": ["action"]
+    }
+}
+
+
+def _handle_process(args, **kw):
+    task_id = kw.get("task_id")
+    action = args.get("action", "")
+    # Coerce to string — some models send session_id as an integer
+    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+
+    if action == "list":
+        return json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
+    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
+        if not session_id:
+            return tool_error(f"session_id is required for {action}")
+        if action == "poll":
+            return json.dumps(process_registry.poll(session_id), ensure_ascii=False)
+        elif action == "log":
+            return json.dumps(process_registry.read_log(
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200)), ensure_ascii=False)
+        elif action == "wait":
+            return json.dumps(process_registry.wait(session_id, timeout=args.get("timeout")), ensure_ascii=False)
+        elif action == "kill":
+            return json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
+        elif action == "write":
+            return json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+        elif action == "submit":
+            return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
+        elif action == "close":
+            return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
+    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+
+
+registry.register(
+    name="process",
+    toolset="terminal",
+    schema=PROCESS_SCHEMA,
+    handler=_handle_process,
+    emoji="⚙️",
+)
