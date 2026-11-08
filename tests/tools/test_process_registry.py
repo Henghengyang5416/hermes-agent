@@ -1299,22 +1299,55 @@ class TestTerminateHostPidPosix:
         # Must not raise.
         pr.ProcessRegistry._terminate_host_pid(999999999)
 
-    def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
+    def test_posix_oserror_falls_back_to_os_killpg(self, monkeypatch):
         from tools import process_registry as pr
         import psutil
 
         def boom(pid):
             raise PermissionError("can't read /proc")
 
+        killpg_calls = []
         kill_calls = []
+
+        def fake_killpg(pid, sig):
+            killpg_calls.append((pid, sig))
 
         def fake_kill(pid, sig):
             kill_calls.append((pid, sig))
 
         monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", boom)
+        monkeypatch.setattr(pr.os, "killpg", fake_killpg)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
 
         pr.ProcessRegistry._terminate_host_pid(12345)
 
+        assert killpg_calls == [(12345, signal.SIGTERM)]
+        assert kill_calls == []
+
+    def test_posix_oserror_falls_back_to_os_kill_if_killpg_fails(self, monkeypatch):
+        from tools import process_registry as pr
+        import psutil
+
+        def boom(pid):
+            raise PermissionError("can't read /proc")
+
+        killpg_calls = []
+        kill_calls = []
+
+        def fake_killpg(pid, sig):
+            killpg_calls.append((pid, sig))
+            raise ProcessLookupError("no such process group")
+
+        def fake_kill(pid, sig):
+            kill_calls.append((pid, sig))
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(psutil, "Process", boom)
+        monkeypatch.setattr(pr.os, "killpg", fake_killpg)
+        monkeypatch.setattr(pr.os, "kill", fake_kill)
+
+        pr.ProcessRegistry._terminate_host_pid(12345)
+
+        assert killpg_calls == [(12345, signal.SIGTERM)]
         assert kill_calls == [(12345, signal.SIGTERM)]
